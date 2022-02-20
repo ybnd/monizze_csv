@@ -1,14 +1,14 @@
 import csv
 from getpass import getpass
 from json import loads
-from logging import Logger, getLogger
 from random import randint
 from typing import Tuple, List, Set
+from argparse import ArgumentParser
 
 from keyring import get_password, set_password, delete_password
 from playwright.sync_api import sync_playwright, Page, TimeoutError
 
-log: Logger = getLogger("monizze_csv")
+KEYRING_KEY: str = __file__
 
 
 class MonizzeTransaction:
@@ -30,43 +30,28 @@ class MonizzeTransaction:
 class MonizzeClient:
     endpoint: str = "https://my.monizze.be/en/"
     _page: Page
-    _token: str
-    _csrf: str
-    _logged_in: bool
-
-    CSRF_XPATH: str = "//head/meta[@name='csrf-token']/@content"
-    TOKEN_XPATH: str = "//form[@id='login-form']/input[@name='_token']/@value"
-    KEYRING_KEY: str = __file__
 
     def __init__(self, page: Page):
         self._page = page
-        self._page.on("request", self._handle_request)
-        self._page.on("response", self._handle_response)
-        self._logged_in = False
-
-    def _handle_request(self, r):
-        print(f"Request: {r}")
-
-    def _handle_response(self, r):
-        print(f"Response: {r}")
 
     def _get_or_prompt_credentials(
             self, email: str, clear: bool
     ) -> Tuple[str, str]:
-        if clear:
-            delete_password(self.KEYRING_KEY, email)
-
-        password = get_password(self.KEYRING_KEY, email)
+        password = get_password(KEYRING_KEY, email)
 
         if password is None:
             password = getpass(prompt=f"Email:    {email}\nPassword: ")
-            set_password(self.KEYRING_KEY, email, password)
+            set_password(KEYRING_KEY, email, password)
+            print("Password saved to keyring")
+        else:
+            print("Got password from keyring")
 
         return email, password
 
     def login(self, email: str, clear: bool = False):
         email, password = self._get_or_prompt_credentials(email, clear)
 
+        print(f"Logging in to Monizze...")
         self._page.goto(self.endpoint + "login", wait_until="networkidle")
 
         try:
@@ -77,48 +62,53 @@ class MonizzeClient:
         self._page.wait_for_timeout(1000)
         self._page.fill("input#email", email)
         self._page.fill("input#password", password)
-        self._page.click("input[type=\"submit\"]", delay=randint(5,50), force=True)
-        self._page.wait_for_timeout(1000)
+        self._page.click(
+            "input[type=\"submit\"]", delay=randint(5,50), force=True
+        )
 
     def get_history(self) -> List[MonizzeTransaction]:
+        print("Retrieving transaction history...")
         history: Set[MonizzeTransaction] = set()
-
-        def _handle_history(r):
-            data = loads(r.value.body())["data"]
-            for voucher, entries in data.items():
-                for entry in entries:
-                    transaction = MonizzeTransaction()
-                    transaction.voucher = voucher
-                    transaction.date = entry["date"]
-                    transaction.amount = float(entry["amount"])
-                    transaction.detail = entry["detail"]
-                    history.add(transaction)
 
         with self._page.expect_response("**/voucher/history") as r:
             self._page.goto(self.endpoint + "history")
 
-        _handle_history(r)
+        self._add_to_history(r, history)
 
         keep_paging = True
 
         while keep_paging:
             with self._page.expect_response("**/voucher/history/*/*/*") as r:
                 try:
-                    self._page.click("tfoot > tr > td > a:last-of-type", timeout=250)
+                    self._page.click(
+                        "tfoot > tr > td > a:last-of-type", timeout=250
+                    )
                 except TimeoutError:
                     keep_paging = False
                     continue
 
             len_t0 = len(history)
-            _handle_history(r)
+            self._add_to_history(r, history)
             if len(history) == len_t0:
                 keep_paging = False
 
         return sorted(history, key=lambda transaction: transaction.date)
 
+    def _add_to_history(self, r, history: Set[MonizzeTransaction]):
+        data = loads(r.value.body())["data"]
+        for voucher, entries in data.items():
+            for entry in entries:
+                transaction = MonizzeTransaction()
+                transaction.voucher = voucher
+                transaction.date = entry["date"]
+                transaction.amount = float(entry["amount"])
+                transaction.detail = entry["detail"]
+                history.add(transaction)
 
-def save_csv(history: List[MonizzeTransaction]) -> None:
-    with open("/home/ybnd/monizze.csv", "w+") as f:
+
+def save_csv(path: str, history: List[MonizzeTransaction]) -> None:
+    print("Saving to CSV...")
+    with open(path, "w+") as f:
         writer = csv.writer(
             f, delimiter=",", quotechar="\"", quoting=csv.QUOTE_ALL
         )
@@ -134,14 +124,39 @@ def save_csv(history: List[MonizzeTransaction]) -> None:
 
 
 if __name__ == '__main__':
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
+    parser = ArgumentParser(
+        prog="monizze-csv",
+        description="scrape transaction history from Monizze and save as CSV."
+    )
+    parser.add_argument(
+        "-e", "--email", type=str, required=True,
+        help="the email address with which to log in"
+    )
+    parser.add_argument(
+        "-o", "--output-path", type=str,
+        help="where to save the CSV"
+    )
+    parser.add_argument(
+        "-c", "--clear", action='store_true',
+        help="clear the stored password for this email address "
+             "from the keyring"
+    )
+    args = parser.parse_args()
 
-        mc = MonizzeClient(page)
-        mc.login("ybnd@tuta.io")
-        save_csv(mc.get_history())
+    if args.clear:
+        delete_password(KEYRING_KEY, args.email)
+        print("Password cleared from keyring.")
+    else:
+        if not args.output_path:
+            raise SystemExit("No output path provided!")
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
 
+            mc = MonizzeClient(page)
+            mc.login(args.email)
+            save_csv(args.output_path, mc.get_history())
 
-        page.context.close()
-        browser.close()
+            page.context.close()
+            browser.close()
+            print("Done.")
