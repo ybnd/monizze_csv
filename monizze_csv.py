@@ -83,8 +83,7 @@ class MonizzeClient:
     @property
     def page(self) -> Page:
         if self._abort:
-            self.close()
-            print(f"Aborted!")
+            print(style(f"Failed to retrieve Monizze data!", ANSI.bold, ANSI.red))
             exit(1)
         else:
             return self._page
@@ -120,6 +119,7 @@ class MonizzeClient:
         self.page.click(
             "input[type=\"submit\"]", delay=randint(5,50), force=True
         )
+        self.page.wait_for_timeout(100)
 
     def get_history(self) -> List[MonizzeTransaction]:
         print("Retrieving transaction history...")
@@ -147,11 +147,13 @@ class MonizzeClient:
             if len(history) == len_t0:
                 keep_paging = False
 
+        self._close()
+
         return sorted(history, key=lambda transaction: transaction.date)
 
-    def close(self):
+    def _close(self):
         self._browser.close()
-        print("Done.")
+
         if self._assets > 0:
             print(style(f"Blocked {self._assets} request(s) for assets", ANSI.black))
         if self._assets > 0:
@@ -180,7 +182,7 @@ class MonizzeClient:
             r.continue_()
 
     def _handle_response(self, r: Response) -> None:
-        if r.status in (500, 400, 401, 403, 302):
+        if r.status in (500, 400, 401, 403):
             print(style(
                 f"HTTP {r.status} ~ {r.request.url}",
                 ANSI.bold, ANSI.red
@@ -214,7 +216,7 @@ def save_csv(path: str, history: List[MonizzeTransaction]) -> None:
 
             if len(old) > 0:
                 print(style(
-                    f"Monizze only reported transactions starting from {oldest.date()}; "
+                    f"Monizze only remembers transactions starting from {oldest.date()}; "
                     f"keeping {len(old)} older transaction(s) in the CSV file.",
                     ANSI.bold, ANSI.orange
                 ))
@@ -261,4 +263,4 @@ if __name__ == '__main__':
             mc = MonizzeClient(p)
             mc.login(args.email)
             save_csv(args.output_path, mc.get_history())
-            mc.close()
+            print("Done.")
