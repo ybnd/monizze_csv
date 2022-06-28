@@ -1,4 +1,5 @@
 import csv
+import sys
 from getpass import getpass
 from json import loads
 from random import randint
@@ -7,7 +8,7 @@ from argparse import ArgumentParser
 from datetime import datetime
 
 from keyring import get_password, set_password, delete_password
-from playwright.sync_api import sync_playwright, Page, TimeoutError
+from playwright.sync_api import sync_playwright, Playwright, Browser, Page, TimeoutError, Response
 
 KEYRING_KEY: str = __file__
 
@@ -44,10 +45,27 @@ class MonizzeTransaction:
 
 class MonizzeClient:
     endpoint: str = "https://my.monizze.be/en/"
+
+    _browser: Browser
     _page: Page
 
-    def __init__(self, page: Page):
-        self._page = page
+    _abort: bool
+
+    def __init__(self, playwright: Playwright):
+        self._browser = playwright.chromium.launch()
+        self._page = self._browser.new_page()
+        self._abort = False
+
+        self.page.on("response", self._handle_response)
+
+    @property
+    def page(self) -> Page:
+        if self._abort:
+            self.close()
+            print(f"Aborted!")
+            exit(1)
+        else:
+            return self._page
 
     def _get_or_prompt_credentials(
             self, email: str, clear: bool
@@ -67,17 +85,17 @@ class MonizzeClient:
         email, password = self._get_or_prompt_credentials(email, clear)
 
         print(f"Logging in to Monizze...")
-        self._page.goto(self.endpoint + "login", wait_until="networkidle")
+        self.page.goto(self.endpoint + "login", wait_until="networkidle")
 
         try:
-            self._page.click("button#onetrust-accept-btn-handler", timeout=50)
+            self.page.click("button#onetrust-accept-btn-handler", timeout=50)
         except TimeoutError:
             pass
 
-        self._page.wait_for_timeout(1000)
-        self._page.fill("input#email", email)
-        self._page.fill("input#password", password)
-        self._page.click(
+        self.page.wait_for_timeout(1000)
+        self.page.fill("input#email", email)
+        self.page.fill("input#password", password)
+        self.page.click(
             "input[type=\"submit\"]", delay=randint(5,50), force=True
         )
 
@@ -85,17 +103,17 @@ class MonizzeClient:
         print("Retrieving transaction history...")
         history: Set[MonizzeTransaction] = set()
 
-        with self._page.expect_response("**/voucher/history") as r:
-            self._page.goto(self.endpoint + "history")
+        with self.page.expect_response("**/voucher/history") as r:
+            self.page.goto(self.endpoint + "history")
 
         self._add_to_history(r, history)
 
         keep_paging = True
 
         while keep_paging:
-            with self._page.expect_response("**/voucher/history/*/*/*") as r:
+            with self.page.expect_response("**/voucher/history/*/*/*") as r:
                 try:
-                    self._page.click(
+                    self.page.click(
                         "tfoot > tr > td > a:last-of-type", timeout=250
                     )
                 except TimeoutError:
@@ -109,6 +127,12 @@ class MonizzeClient:
 
         return sorted(history, key=lambda transaction: transaction.date)
 
+    def close(self):
+        self._browser.close()
+
+    def abort(self):
+        self._abort = True
+
     def _add_to_history(self, r, history: Set[MonizzeTransaction]):
         data = loads(r.value.body())["data"]
         for voucher, entries in data.items():
@@ -117,6 +141,11 @@ class MonizzeClient:
                     entry["date"], voucher, entry["amount"], entry["detail"]
                 )
                 history.add(transaction)
+
+    def _handle_response(self, r: Response):
+        if r.status in (500, 400, 401, 403):
+            print(f"HTTP {r.status} ~ {r.request.url}")
+            self._abort = True
 
 
 def before(t0: str, t1: str) -> bool:
@@ -145,7 +174,8 @@ def save_csv(path: str, history: List[MonizzeTransaction]) -> None:
             if len(old) > 0:
                 print(
                     f"Monizze only reported transactions starting from {oldest}; "
-                    f"keeping {len(old)} older transaction(s) already present in CSV file."
+                    f"keeping {len(old)} older transaction(s) "
+                    f"that were already present in CSV file."
                 )
     except FileNotFoundError:
         # No such CSV file? nothing to do here!
@@ -188,14 +218,11 @@ if __name__ == '__main__':
     else:
         if not args.output_path:
             raise SystemExit("No output path provided!")
-        with sync_playwright() as p:
-            browser = p.chromium.launch()
-            page = browser.new_page()
 
-            mc = MonizzeClient(page)
+        with sync_playwright() as p:
+            mc = MonizzeClient(p)
             mc.login(args.email)
             save_csv(args.output_path, mc.get_history())
+            mc.close()
 
-            page.context.close()
-            browser.close()
             print("Done.")
