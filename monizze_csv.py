@@ -4,6 +4,7 @@ from json import loads
 from random import randint
 from typing import Tuple, List, Set
 from argparse import ArgumentParser
+from datetime import datetime
 
 from keyring import get_password, set_password, delete_password
 from playwright.sync_api import sync_playwright, Page, TimeoutError
@@ -17,6 +18,12 @@ class MonizzeTransaction:
     amount: float
     detail: str
 
+    def __init__(self, date: str, voucher: str, amount: str, detail: str):
+        self.date = date
+        self.voucher = voucher
+        self.amount = float(amount)
+        self.detail = detail
+
     def __hash__(self):
         return hash(self.date) \
                ^ hash(self.voucher) \
@@ -26,6 +33,14 @@ class MonizzeTransaction:
     def __eq__(self, other):
         return hash(self) == hash(other)
 
+    @property
+    def row(self) -> List[str]:
+        return [
+            self.date,
+            self.voucher,
+            self.amount,
+            self.detail,
+        ]
 
 class MonizzeClient:
     endpoint: str = "https://my.monizze.be/en/"
@@ -98,29 +113,53 @@ class MonizzeClient:
         data = loads(r.value.body())["data"]
         for voucher, entries in data.items():
             for entry in entries:
-                transaction = MonizzeTransaction()
-                transaction.voucher = voucher
-                transaction.date = entry["date"]
-                transaction.amount = float(entry["amount"])
-                transaction.detail = entry["detail"]
+                transaction = MonizzeTransaction(
+                    entry["date"], voucher, entry["amount"], entry["detail"]
+                )
                 history.add(transaction)
 
 
+def before(t0: str, t1: str) -> bool:
+    return datetime.fromisoformat(t0) < datetime.fromisoformat(t1)
+
+
 def save_csv(path: str, history: List[MonizzeTransaction]) -> None:
+    # Monizze seems to only show transactions for the last year or so
+    # -> keep any transactions older than the ones we've just retrieved
+    oldest = history[0].date
+    old: List[MonizzeTransaction] = []
+    try:
+        with open(path, "r") as f:
+            reader = csv.reader(
+                f, delimiter=",", quotechar="\"", quoting=csv.QUOTE_ALL
+            )
+            next(reader) # skip header
+            older_than_current = True
+            while older_than_current:
+                row = next(reader)
+                if before(row[0], oldest):
+                    old.append(MonizzeTransaction(*row))
+                else:
+                    older_than_current = False
+
+            if len(old) > 0:
+                print(
+                    f"Monizze only reported transactions starting from {oldest}; "
+                    f"keeping {len(old)} older transaction(s) already present in CSV file."
+                )
+    except FileNotFoundError:
+        # No such CSV file? nothing to do here!
+        pass
+
     print("Saving to CSV...")
-    with open(path, "w+") as f:
+    with open(path, "w+", newline="") as f:
         writer = csv.writer(
             f, delimiter=",", quotechar="\"", quoting=csv.QUOTE_ALL
         )
         writer.writerow(["Date", "Monizze Voucher", "Amount", "Detail"])
 
-        for transaction in history:
-            writer.writerow([
-                transaction.date,
-                transaction.voucher,
-                transaction.amount,
-                transaction.detail
-            ])
+        for transaction in old + history:
+            writer.writerow(transaction.row)
 
 
 if __name__ == '__main__':
