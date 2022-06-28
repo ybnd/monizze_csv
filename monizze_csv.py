@@ -1,5 +1,5 @@
 import csv
-import sys
+import re
 from getpass import getpass
 from json import loads
 from random import randint
@@ -8,7 +8,7 @@ from argparse import ArgumentParser
 from datetime import datetime
 
 from keyring import get_password, set_password, delete_password
-from playwright.sync_api import sync_playwright, Playwright, Browser, Page, TimeoutError, Response
+from playwright.sync_api import sync_playwright, Playwright, Browser, Page, TimeoutError, Route, Response
 
 KEYRING_KEY: str = __file__
 
@@ -51,11 +51,20 @@ class MonizzeClient:
 
     _abort: bool
 
+    re_domain = re.compile(r"^(?!https://(my|happy).monizze.be).*$")
+    _assets: int
+    _3party: int
+
     def __init__(self, playwright: Playwright):
+        print("Starting Monizze session")
+
         self._browser = playwright.chromium.launch()
         self._page = self._browser.new_page()
         self._abort = False
+        self._assets = 0
+        self._3party = 0
 
+        self.page.route("**/*", self._block_routes)
         self.page.on("response", self._handle_response)
 
     @property
@@ -84,7 +93,7 @@ class MonizzeClient:
     def login(self, email: str, clear: bool = False):
         email, password = self._get_or_prompt_credentials(email, clear)
 
-        print(f"Logging in to Monizze...")
+        print(f"Logging in...")
         self.page.goto(self.endpoint + "login", wait_until="networkidle")
 
         try:
@@ -92,7 +101,7 @@ class MonizzeClient:
         except TimeoutError:
             pass
 
-        self.page.wait_for_timeout(1000)
+        self.page.wait_for_timeout(500)
         self.page.fill("input#email", email)
         self.page.fill("input#password", password)
         self.page.click(
@@ -129,6 +138,11 @@ class MonizzeClient:
 
     def close(self):
         self._browser.close()
+        print("Done.")
+        if self._assets > 0:
+            print(f"Blocked {self._assets} request(s) for assets")
+        if self._assets > 0:
+            print(f"Blocked {self._3party} third-party request(s)")
 
     def abort(self):
         self._abort = True
@@ -142,7 +156,17 @@ class MonizzeClient:
                 )
                 history.add(transaction)
 
-    def _handle_response(self, r: Response):
+    def _block_routes(self, r: Route) -> None:
+        if self.re_domain.match(r.request.url):
+            self._3party += 1
+            r.abort()
+        elif r.request.resource_type in ("stylesheet", "image", "font"):
+            self._assets += 1
+            r.abort()
+        else:
+            r.continue_()
+
+    def _handle_response(self, r: Response) -> None:
         if r.status in (500, 400, 401, 403):
             print(f"HTTP {r.status} ~ {r.request.url}")
             self._abort = True
@@ -224,5 +248,3 @@ if __name__ == '__main__':
             mc.login(args.email)
             save_csv(args.output_path, mc.get_history())
             mc.close()
-
-            print("Done.")
