@@ -6,11 +6,24 @@ from random import randint
 from typing import Tuple, List, Set
 from argparse import ArgumentParser
 from datetime import datetime
+from enum import Enum
 
 from keyring import get_password, set_password, delete_password
 from playwright.sync_api import sync_playwright, Playwright, Browser, Page, TimeoutError, Route, Response
 
 KEYRING_KEY: str = __file__
+
+
+class ANSI(str, Enum):
+    end = "\033[0m"
+    bold = "\033[01m"
+    black = "\033[30m"
+    red = "\033[31m"
+    orange = "\033[93m"
+
+
+def style(text: str, *ansi: ANSI) -> str:
+    return "".join(ansi) + text + ANSI.end
 
 
 class MonizzeTransaction:
@@ -140,9 +153,9 @@ class MonizzeClient:
         self._browser.close()
         print("Done.")
         if self._assets > 0:
-            print(f"Blocked {self._assets} request(s) for assets")
+            print(style(f"Blocked {self._assets} request(s) for assets", ANSI.black))
         if self._assets > 0:
-            print(f"Blocked {self._3party} third-party request(s)")
+            print(style(f"Blocked {self._3party} third-party request(s)", ANSI.black))
 
     def abort(self):
         self._abort = True
@@ -167,8 +180,11 @@ class MonizzeClient:
             r.continue_()
 
     def _handle_response(self, r: Response) -> None:
-        if r.status in (500, 400, 401, 403):
-            print(f"HTTP {r.status} ~ {r.request.url}")
+        if r.status in (500, 400, 401, 403, 302):
+            print(style(
+                f"HTTP {r.status} ~ {r.request.url}",
+                ANSI.bold, ANSI.red
+            ))
             self._abort = True
 
 
@@ -179,7 +195,7 @@ def before(t0: str, t1: str) -> bool:
 def save_csv(path: str, history: List[MonizzeTransaction]) -> None:
     # Monizze seems to only show transactions for the last year or so
     # -> keep any transactions older than the ones we've just retrieved
-    oldest = history[0].date
+    oldest = datetime.fromisoformat(history[0].date)
     old: List[MonizzeTransaction] = []
     try:
         with open(path, "r") as f:
@@ -190,17 +206,18 @@ def save_csv(path: str, history: List[MonizzeTransaction]) -> None:
             older_than_current = True
             while older_than_current:
                 row = next(reader)
-                if before(row[0], oldest):
+                dt = datetime.fromisoformat(row[0])
+                if dt < oldest:
                     old.append(MonizzeTransaction(*row))
                 else:
                     older_than_current = False
 
             if len(old) > 0:
-                print(
-                    f"Monizze only reported transactions starting from {oldest}; "
-                    f"keeping {len(old)} older transaction(s) "
-                    f"that were already present in CSV file."
-                )
+                print(style(
+                    f"Monizze only reported transactions starting from {oldest.date()}; "
+                    f"keeping {len(old)} older transaction(s) in the CSV file.",
+                    ANSI.bold, ANSI.orange
+                ))
     except FileNotFoundError:
         # No such CSV file? nothing to do here!
         pass
@@ -226,7 +243,7 @@ if __name__ == '__main__':
         help="the email address with which to log in"
     )
     parser.add_argument(
-        "-o", "--output-path", type=str,
+        "-o", "--output-path", type=str, required=True,
         help="where to save the CSV"
     )
     parser.add_argument(
@@ -240,9 +257,6 @@ if __name__ == '__main__':
         delete_password(KEYRING_KEY, args.email)
         print("Password cleared from keyring.")
     else:
-        if not args.output_path:
-            raise SystemExit("No output path provided!")
-
         with sync_playwright() as p:
             mc = MonizzeClient(p)
             mc.login(args.email)
