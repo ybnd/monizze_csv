@@ -1,5 +1,6 @@
 import csv
 import re
+import uuid
 from getpass import getpass
 from json import loads
 from random import randint
@@ -64,15 +65,29 @@ class MonizzeClient:
 
     _abort: bool
 
-    re_domain = re.compile(r"^(?!https://(my|happy).monizze.be).*$")
+    re_domain = re.compile(r"^https://((my|happy).monizze.be|www.(google|gstatic).com/recaptcha).*$")
+
+    ALLOWED_DOMAINS = (
+        "https://my.monizze.be",
+        "https://happy.monizze.be",
+        "https://www.google.com/recaptcha",
+        "https://www.gstatic.com/recaptcha",
+    )
+
     _assets: int
     _3party: int
 
-    def __init__(self, playwright: Playwright):
+    _verbose: bool = False
+
+    def __init__(self, playwright: Playwright, verbose: bool = False):
         print("Starting Monizze session")
+        self._verbose = verbose
 
         self._browser = playwright.chromium.launch()
-        self._page = self._browser.new_page()
+        context = self._browser.new_context(
+            user_agent=str(uuid.uuid4())
+        )
+        self._page = context.new_page()
         self._abort = False
         self._assets = 0
         self._3party = 0
@@ -116,10 +131,18 @@ class MonizzeClient:
         self.page.wait_for_timeout(500)
         self.page.fill("input#email", email)
         self.page.fill("input#password", password)
-        self.page.click(
-            "input[type=\"submit\"]", delay=randint(5,50), force=True
-        )
-        self.page.wait_for_timeout(100)
+
+        try:
+            with self.page.expect_response("**/my-monizze/user", timeout=5000):
+                self.page.click(
+                    "input[type=\"submit\"]", delay=randint(5, 50)
+                )
+        except TimeoutError:
+            print(style(
+                f"Timed out while logging in (hit reCAPTCHA or HTML was changed)",
+                ANSI.bold, ANSI.red,
+            ))
+            self._abort = True
 
     def get_history(self) -> List[MonizzeTransaction]:
         print("Retrieving transaction history...")
@@ -172,19 +195,39 @@ class MonizzeClient:
                 history.add(transaction)
 
     def _block_routes(self, r: Route) -> None:
-        if self.re_domain.match(r.request.url):
+        if not any(r.request.url.startswith(d) for d in self.ALLOWED_DOMAINS):
+            if self._verbose:
+                print(style(
+                    f"Blocked 3rd party request: {r.request.method} {r.request.url}",
+                    ANSI.black,
+                ))
             self._3party += 1
             r.abort()
         elif r.request.resource_type in ("stylesheet", "image", "font"):
+            if self._verbose:
+                print(style(
+                    f"Blocked asset request:     {r.request.method} {r.request.url}",
+                    ANSI.black,
+                ))
             self._assets += 1
             r.abort()
         else:
+            if self._verbose:
+                print(style(
+                    f" → {r.request.method} {r.request.url}",
+                    ANSI.black,
+                ))
             r.continue_()
 
     def _handle_response(self, r: Response) -> None:
-        if r.status in (500, 400, 401, 403):
+        if self._verbose:
             print(style(
-                f"HTTP {r.status} ~ {r.request.url}",
+                f" ← HTTP {r.status} ~ {r.request.method} {r.request.url}",
+                ANSI.black,
+            ))
+        if r.status in (500, 400, 401, 403, 429):
+            print(style(
+                f" × HTTP {r.status} ~ {r.request.url}",
                 ANSI.bold, ANSI.red
             ))
             self._abort = True
@@ -245,7 +288,7 @@ if __name__ == '__main__':
         help="the email address with which to log in"
     )
     parser.add_argument(
-        "-o", "--output-path", type=str, required=True,
+        "-o", "--output-path", type=str,
         help="where to save the CSV"
     )
     parser.add_argument(
@@ -253,14 +296,22 @@ if __name__ == '__main__':
         help="clear the stored password for this email address "
              "from the keyring"
     )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="show detailed messages"
+    )
     args = parser.parse_args()
 
     if args.clear:
         delete_password(KEYRING_KEY, args.email)
         print("Password cleared from keyring.")
     else:
+        if not args.output_path:
+            print("No output path specified (-o/--output-path is required unless running with --clear)")
+            exit(1)
+
         with sync_playwright() as p:
-            mc = MonizzeClient(p)
+            mc = MonizzeClient(p, args.verbose)
             mc.login(args.email)
             save_csv(args.output_path, mc.get_history())
             print("Done.")
