@@ -85,7 +85,7 @@ class MonizzeClient:
 
         self._browser = playwright.chromium.launch()
         context = self._browser.new_context(
-            user_agent=str(uuid.uuid4())
+            user_agent="Monizze CSV"
         )
         self._page = context.new_page()
         self._abort = False
@@ -117,22 +117,26 @@ class MonizzeClient:
 
         return email, password
 
-    def login(self, email: str, clear: bool = False):
+    def login(self, email: str, clear: bool = False) -> bool:
         email, password = self._get_or_prompt_credentials(email, clear)
 
         print(f"Logging in...")
-        self.page.goto(self.endpoint + "login", wait_until="networkidle")
+        self.page.goto(self.endpoint + "login", wait_until="networkidle", timeout=5000)
 
         try:
             self.page.click("button#onetrust-accept-btn-handler", timeout=50)
         except TimeoutError:
             pass
 
-        self.page.wait_for_timeout(500)
-        self.page.fill("input#email", email)
-        self.page.fill("input#password", password)
+        try:
+            self.page.click("form#login-form button.mb-5", timeout=50)  # todo: very fragile selector
+        except TimeoutError:
+            pass
 
         try:
+            self.page.wait_for_timeout(500)
+            self.page.fill("input#email", email)
+            self.page.fill("input#password", password)
             with self.page.expect_response("**/my-monizze/user", timeout=5000):
                 self.page.click(
                     "input[type=\"submit\"]", delay=randint(5, 50)
@@ -142,7 +146,11 @@ class MonizzeClient:
                 f"Timed out while logging in (hit reCAPTCHA or HTML was changed)",
                 ANSI.bold, ANSI.red,
             ))
+            self.page.screenshot(type="png", path="/home/ybnd/page.png")
             self._abort = True
+            return False
+
+        return True
 
     def get_history(self) -> List[MonizzeTransaction]:
         print("Retrieving transaction history...")
@@ -240,6 +248,7 @@ def before(t0: str, t1: str) -> bool:
 def save_csv(path: str, history: List[MonizzeTransaction]) -> None:
     # Monizze seems to only show transactions for the last year or so
     # -> keep any transactions older than the ones we've just retrieved
+    # todo: don't even overwrite older entries!
     oldest = datetime.fromisoformat(history[0].date)
     old: List[MonizzeTransaction] = []
     try:
@@ -312,6 +321,8 @@ if __name__ == '__main__':
 
         with sync_playwright() as p:
             mc = MonizzeClient(p, args.verbose)
-            mc.login(args.email)
-            save_csv(args.output_path, mc.get_history())
-            print("Done.")
+            ok = mc.login(args.email)
+
+            if ok:
+                save_csv(args.output_path, mc.get_history())
+                print("Done.")
